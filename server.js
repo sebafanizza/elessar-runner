@@ -61,14 +61,25 @@ app.get('/pay-bolletta-test', (req, res) => {
 });
 // === ROUTE REALE: genera link banca via Tink ===
 app.get('/pay-bolletta', async (req, res) => {
-  const { importo, iban, ente = 'Fornitore', descr = 'Pagamento bolletta' } = req.query;
+  try {
+    const { importo, iban, ente = 'Fornitore', descr = 'Pagamento bolletta' } = req.query;
+    if (!importo || !iban) return res.status(400).send('Manca importo o IBAN');
 
-  // Controllo env: se manca qualcosa, meglio dirlo chiaro
-  if (!process.env.TINK_CLIENT_ID || !process.env.TINK_CLIENT_SECRET || !process.env.TINK_REDIRECT_URI) {
-    return res
-      .status(500)
-      .send('Tink non configurato: imposta TINK_CLIENT_ID, TINK_CLIENT_SECRET, TINK_REDIRECT_URI su Render.');
+    // NB: amountEur deve essere intero per il primo test (es. 12, non 12.34)
+    const { id } = await tinkCreatePaymentRequest({
+      amountEur: importo,
+      iban,
+      name: ente,
+      description: descr
+    });
+
+    const link = tinkPaymentLink(id);
+    return res.redirect(link);
+  } catch (e) {
+    return res.status(500).send('Errore Tink: ' + e.message);
   }
+});
+
 
   try {
     // 1) token client-credentials
