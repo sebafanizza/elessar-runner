@@ -76,7 +76,7 @@ app.get('/pay-bolletta', async (req, res) => {
       grant_type: 'client_credentials',
       client_id: process.env.TINK_CLIENT_ID,
       client_secret: process.env.TINK_CLIENT_SECRET,
-      scope: 'payments:write payments:read'
+      scope: 'payment:write payment:read'
     });
     const tokRes = await fetch('https://api.tink.com/api/v1/oauth/token', {
       method: 'POST',
