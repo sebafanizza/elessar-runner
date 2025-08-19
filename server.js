@@ -51,15 +51,46 @@ async function tinkToken() {
   return data.access_token;
 }
 
-// Crea payment request — amount intero in EUR (es. 12 = €12). IBAN valido.
+// Crea payment request — Tink vuole il "creditor" con IBAN
 async function tinkCreatePaymentRequest({ amountEurInt, iban, name, description }) {
   const access = await tinkToken();
+
   const payload = {
-    amount: Number(amountEurInt),           // usare interi per il primo test
+    amount: Number(amountEurInt),          // usa interi per ora (es. 12)
     currency: 'EUR',
-    destination: { type: 'iban', accountNumber: String(iban || '') },
-    reference: description || 'Pagamento bolletta'
+    creditor: {
+      name: name || 'Beneficiario',
+      account: {
+        identifiers: {
+          iban: String(iban || '')
+        }
+      }
+    },
+    remittanceInformation: {
+      type: 'UNSTRUCTURED',
+      value: description || 'Pagamento bolletta'
+    }
   };
+
+  console.log('TINK PR payload:', payload);
+
+  const res = await fetch('https://api.tink.com/api/v1/payments/requests', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${access}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    console.error('TINK PR error body:', data);
+    throw new Error('Create payment request error: ' + JSON.stringify(data));
+  }
+  return { id: data.id };
+}
+
   // log difensivo
   console.log('TINK PR payload:', payload);
 
