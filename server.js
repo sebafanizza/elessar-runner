@@ -86,19 +86,35 @@ app.get('/pay-bolletta', async (req, res) => {
     const tok = await tokRes.json();
     if (!tokRes.ok) throw new Error('Token: ' + JSON.stringify(tok));
 
-    // 2) crea payment request (importo in centesimi)
-    const payload = {
-      amount: { value: Math.round(Number(importo) * 100), currency: 'EUR' },
-      recipient: { iban, name: ente },
-      description: descr
-    };
-    const prRes = await fetch('https://api.tink.com/api/v1/payments/requests', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${tok.access_token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const pr = await prRes.json();
-    if (!prRes.ok) throw new Error('Create PR: ' + JSON.stringify(pr));
+    // 2) crea "payment request" (amount in unità di valuta, non centesimi)
+async function tinkCreatePaymentRequest({ amountEur, iban, name, description }) {
+  const access = await tinkToken();
+
+  const payload = {
+    amount: Number(amountEur),            // es. 12.34 non è ammesso: usa 12 o 13
+    currency: 'EUR',
+    destination: {
+      type: 'iban',
+      accountNumber: iban
+    },
+    reference: description || 'Pagamento bolletta'
+    // opzionale: payerMessage / endToEndId / merchantReference ...
+  };
+
+  const res = await fetch('https://api.tink.com/api/v1/payments/requests', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${access}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await res.json();
+  if (!res.ok) throw new Error('Create payment request error: ' + JSON.stringify(data));
+  return { id: data.id, access };
+}
+
 
     // 3) costruisci Tink Link e reindirizza
     const q = new URLSearchParams({
