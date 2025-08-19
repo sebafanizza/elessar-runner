@@ -1,17 +1,16 @@
-// server.js  — Elessar runner (CommonJS)
+// server.js — Elessar runner (CommonJS, compatibile Render)
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const { twiml: { MessagingResponse } } = require('twilio');
 
-// ───────────────────────────────────────────────────────────────────────────────
-// fetch shim per ogni versione di Node (anche se in Node >=18 è built-in)
+// fetch shim (in Node >=18 c'è già; lo lasciamo per compatibilità)
 if (typeof fetch === 'undefined') {
   global.fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Helpers Airtable
+// Airtable helper
 async function airtableCreate(table, fields) {
   const baseId = process.env.AIRTABLE_BASE_ID;
   const apiKey = process.env.AIRTABLE_API_KEY;
@@ -32,8 +31,8 @@ async function airtableCreate(table, fields) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Helpers Tink (sandbox/reale)
-// Scope corretti: 'payment:write payment:read' (SINGOLARE)
+// Tink helpers
+// Scope corretti (singolare): payment:write payment:read
 async function tinkToken() {
   const { TINK_CLIENT_ID, TINK_CLIENT_SECRET } = process.env;
   const res = await fetch('https://api.tink.com/api/v1/oauth/token', {
@@ -51,27 +50,18 @@ async function tinkToken() {
   return data.access_token;
 }
 
-// Crea payment request — Tink vuole il "creditor" con IBAN
-async function tinkCreatePaymentRequest({ amountEurInt, iban, name, description }) {
+// ✅ Create Payment Request: usare "destinations" con IBAN (amount intero, EUR)
+async function tinkCreatePaymentRequest({ amountEurInt, iban, description }) {
   const access = await tinkToken();
 
   const payload = {
-    amount: Number(amountEurInt),          // usa interi per ora (es. 12)
+    amount: Number(amountEurInt),         // es. 12 (usiamo intero per il primo test)
     currency: 'EUR',
-    creditor: {
-      name: name || 'Beneficiario',
-      account: {
-        identifiers: {
-          iban: String(iban || '')
-        }
-      }
-    },
-    remittanceInformation: {
-      type: 'UNSTRUCTURED',
-      value: description || 'Pagamento bolletta'
-    }
+    destinations: [
+      { type: 'iban', accountNumber: String(iban || '') }
+    ],
+    reference: description || 'Pagamento bolletta'
   };
-
   console.log('TINK PR payload:', payload);
 
   const res = await fetch('https://api.tink.com/api/v1/payments/requests', {
@@ -91,22 +81,7 @@ async function tinkCreatePaymentRequest({ amountEurInt, iban, name, description 
   return { id: data.id };
 }
 
-  // log difensivo
-  console.log('TINK PR payload:', payload);
-
-  const res = await fetch('https://api.tink.com/api/v1/payments/requests', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${access}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    console.error('TINK PR error body:', data);
-    throw new Error('Create payment request error: ' + JSON.stringify(data));
-  }
-  return { id: data.id };
-}
-
+// Costruisci Tink Link
 function tinkPaymentLink(paymentRequestId) {
   const q = new URLSearchParams({
     client_id: process.env.TINK_CLIENT_ID || '',
@@ -118,6 +93,7 @@ function tinkPaymentLink(paymentRequestId) {
   return `https://link.tink.com/1.0/payments/pay?${q}`;
 }
 
+// Stato pagamento (semplice)
 async function tinkGetStatus(paymentRequestId) {
   const access = await tinkToken();
   const url = `https://api.tink.com/api/v1/payments/requests/${paymentRequestId}/transfers`;
@@ -125,26 +101,22 @@ async function tinkGetStatus(paymentRequestId) {
   const data = await res.json();
   if (!res.ok) throw new Error('Status error: ' + JSON.stringify(data));
   const s = JSON.stringify(data).toLowerCase();
-  const paid = s.includes('executed') || s.includes('completed');
-  return paid ? 'paid' : 'pending';
+  return (s.includes('executed') || s.includes('completed')) ? 'paid' : 'pending';
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false })); // Twilio manda form-encoded
+app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 // Ping
 app.get('/', (_req, res) => res.send('Elessar runner ok'));
 
-// Test Airtable (crea una riga finta su Jobs)
+// Test Airtable
 app.get('/test-airtable', async (_req, res) => {
   try {
     const out = await airtableCreate('Jobs', {
-      Tipo: 'altro',
-      Stato: 'nuovo',
-      Utente: 'test',
-      Dettagli: 'ping'
+      Tipo: 'altro', Stato: 'nuovo', Utente: 'test', Dettagli: 'ping'
     });
     res.status(200).send('OK: ' + JSON.stringify(out));
   } catch (e) {
@@ -152,7 +124,7 @@ app.get('/test-airtable', async (_req, res) => {
   }
 });
 
-// Stub pagamento (pagina intermedia “Autorizza” che rimbalza alla callback)
+// Stub pagamento (pagina finta)
 app.get('/pay-bolletta-test', (req, res) => {
   const { importo = '49', iban = 'IT60X0542811101000000123456', ente = 'Fornitore Luce', scadenza = '2025-09-10' } = req.query;
   const url = new URL('/tink/callback', process.env.APP_URL || 'https://example.com');
@@ -170,25 +142,23 @@ app.get('/pay-bolletta-test', (req, res) => {
   `);
 });
 
-// Pagamento reale: genera Tink Link e reindirizza
+// Reale: genera payment request e reindirizza a Tink Link
 app.get('/pay-bolletta', async (req, res) => {
   try {
     const { importo, iban, ente = 'Fornitore', descr = 'Pagamento bolletta' } = req.query;
     if (!importo || !iban) return res.status(400).send('Manca importo o IBAN');
 
-    // per il primo test usa importo intero (es. 12). Se scrivi 12.34 lo arrotondo.
+    // per test usa intero: "12" (se 12.34 lo arrotondo)
     const amountInt = Math.round(Number(String(importo).replace(',', '.')));
 
-    // controllo env minimi
     if (!process.env.TINK_CLIENT_ID || !process.env.TINK_CLIENT_SECRET || !process.env.TINK_REDIRECT_URI) {
-      return res.status(500).send('Tink non configurato: imposta TINK_CLIENT_ID, TINK_CLIENT_SECRET, TINK_REDIRECT_URI');
+      return res.status(500).send('Tink non configurato: TINK_CLIENT_ID, TINK_CLIENT_SECRET, TINK_REDIRECT_URI');
     }
 
     const { id } = await tinkCreatePaymentRequest({
       amountEurInt: amountInt,
       iban,
-      name: ente,
-      description: descr
+      description: descr || `Pagamento ${ente}`
     });
 
     const link = tinkPaymentLink(id);
@@ -198,7 +168,7 @@ app.get('/pay-bolletta', async (req, res) => {
   }
 });
 
-// Callback Tink: salva ricevuta in Airtable
+// Callback Tink: salva ricevuta
 app.get('/tink/callback', async (req, res) => {
   try {
     const paymentRequestId = req.query.payment_request_id || req.query.paymentRequestId || null;
@@ -206,8 +176,7 @@ app.get('/tink/callback', async (req, res) => {
 
     let status = 'pending';
     if (paymentRequestId) {
-      try { status = await tinkGetStatus(paymentRequestId); }
-      catch (_e) { /* se lo status fallisce, lasciamo pending */ }
+      try { status = await tinkGetStatus(paymentRequestId); } catch (_) {}
     }
 
     await airtableCreate('Receipts', {
@@ -231,7 +200,7 @@ app.get('/tink/callback', async (req, res) => {
   }
 });
 
-// Webhook WhatsApp (routing base)
+// WhatsApp webhook (routing semplice)
 app.post('/whatsapp/webhook', async (req, res) => {
   const from = req.body.From || '';
   const text = (req.body.Body || '').trim().toLowerCase();
@@ -269,6 +238,5 @@ app.post('/whatsapp/webhook', async (req, res) => {
   res.type('text/xml').send(reply.toString());
 });
 
-// ───────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Runner up on ' + PORT));
