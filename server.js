@@ -59,6 +59,60 @@ app.get('/pay-bolletta-test', (req, res) => {
     </body></html>
   `);
 });
+// === ROUTE REALE: genera link banca via Tink ===
+app.get('/pay-bolletta', async (req, res) => {
+  const { importo, iban, ente = 'Fornitore', descr = 'Pagamento bolletta' } = req.query;
+
+  // Controllo env: se manca qualcosa, meglio dirlo chiaro
+  if (!process.env.TINK_CLIENT_ID || !process.env.TINK_CLIENT_SECRET || !process.env.TINK_REDIRECT_URI) {
+    return res
+      .status(500)
+      .send('Tink non configurato: imposta TINK_CLIENT_ID, TINK_CLIENT_SECRET, TINK_REDIRECT_URI su Render.');
+  }
+
+  try {
+    // 1) token client-credentials
+    const body = new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: process.env.TINK_CLIENT_ID,
+      client_secret: process.env.TINK_CLIENT_SECRET,
+      scope: 'payments:write payments:read'
+    });
+    const tokRes = await fetch('https://api.tink.com/api/v1/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+    const tok = await tokRes.json();
+    if (!tokRes.ok) throw new Error('Token: ' + JSON.stringify(tok));
+
+    // 2) crea payment request (importo in centesimi)
+    const payload = {
+      amount: { value: Math.round(Number(importo) * 100), currency: 'EUR' },
+      recipient: { iban, name: ente },
+      description: descr
+    };
+    const prRes = await fetch('https://api.tink.com/api/v1/payments/requests', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${tok.access_token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const pr = await prRes.json();
+    if (!prRes.ok) throw new Error('Create PR: ' + JSON.stringify(pr));
+
+    // 3) costruisci Tink Link e reindirizza
+    const q = new URLSearchParams({
+      client_id: process.env.TINK_CLIENT_ID,
+      redirect_uri: process.env.TINK_REDIRECT_URI,
+      payment_request_id: pr.id,
+      market: process.env.TINK_MARKET || 'IT',
+      locale: process.env.TINK_LOCALE || 'it_IT'
+    }).toString();
+    return res.redirect(`https://link.tink.com/1.0/payments/pay?${q}`);
+  } catch (e) {
+    return res.status(500).send('Errore Tink: ' + e.message);
+  }
+});
 
 // ✅ CALLBACK “banca” (STUB): salva ricevuta
 app.get('/tink/callback', async (req, res) => {
