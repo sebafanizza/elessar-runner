@@ -100,6 +100,8 @@ async function tinkCreatePaymentRequest({ amountEur, iban, name, description }) 
     reference: description || 'Pagamento bolletta'
     // opzionale: payerMessage / endToEndId / merchantReference ...
   };
+console.log('TINK PR payload:', payload);
+if (!res.ok) console.error('TINK PR error body:', data);
 
   const res = await fetch('https://api.tink.com/api/v1/payments/requests', {
     method: 'POST',
