@@ -58,21 +58,22 @@ async function tinkToken() {
   return data.access_token;
 }
 
-// ✅ Payment Request (Tink): market + destinations (iban+name) + reference
+// ✅ Payment Request corretto per Tink: market + destinations (iban + holderName) + reference
 async function tinkCreatePaymentRequest({ amountEur, iban, recipientName, description, market }) {
   const access = await tinkToken();
 
-  // per affidabilità in sandbox: usa interi (12) la prima volta
+  // usa interi per il primo test (12 = €12)
   const amountInt = Math.round(Number(String(amountEur).replace(',', '.')));
+
   const payload = {
-    amount: amountInt,                       // es. 12 = €12
+    amount: amountInt,
     currency: 'EUR',
     market: market || (process.env.TINK_MARKET || 'IT'),
     destinations: [
       {
         type: 'iban',
         accountNumber: String(iban),
-        name: recipientName || 'Beneficiario'
+        holderName: recipientName || 'Beneficiario'   // 👈 nome giusto qui
       }
     ],
     reference: description || 'Pagamento bolletta'
@@ -85,33 +86,13 @@ async function tinkCreatePaymentRequest({ amountEur, iban, recipientName, descri
     headers: { 'Authorization': `Bearer ${access}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
+
   const data = await res.json();
   if (!res.ok) {
     console.error('TINK PR error body:', data);
     throw new Error('Create payment request error: ' + JSON.stringify(data));
   }
   return { id: data.id };
-}
-
-function tinkPaymentLink(paymentRequestId, market) {
-  const q = new URLSearchParams({
-    client_id: process.env.TINK_CLIENT_ID || '',
-    redirect_uri: process.env.TINK_REDIRECT_URI || '',
-    payment_request_id: paymentRequestId,
-    market: market || (process.env.TINK_MARKET || 'IT'),
-    locale: process.env.TINK_LOCALE || 'it_IT'
-  }).toString();
-  return `https://link.tink.com/1.0/payments/pay?${q}`;
-}
-
-async function tinkGetStatus(paymentRequestId) {
-  const access = await tinkToken();
-  const url = `https://api.tink.com/api/v1/payments/requests/${paymentRequestId}/transfers`;
-  const res = await fetch(url, { headers: { 'Authorization': `Bearer ${access}` } });
-  const data = await res.json();
-  if (!res.ok) throw new Error('Status error: ' + JSON.stringify(data));
-  const s = JSON.stringify(data).toLowerCase();
-  return (s.includes('executed') || s.includes('completed')) ? 'paid' : 'pending';
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
