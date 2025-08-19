@@ -58,25 +58,24 @@ async function tinkToken() {
   return data.access_token;
 }
 
-// ✅ Payment Request corretto per Tink: market + destinations (iban + holderName) + reference
+// ✅ Payment Request Tink: recipient + remittanceInformation (UNSTRUCTURED)
 async function tinkCreatePaymentRequest({ amountEur, iban, recipientName, description, market }) {
   const access = await tinkToken();
 
-  // usa interi per il primo test (12 = €12)
+  // usa un intero per i primi test (12 = €12)
   const amountInt = Math.round(Number(String(amountEur).replace(',', '.')));
-
   const payload = {
     amount: amountInt,
     currency: 'EUR',
     market: market || (process.env.TINK_MARKET || 'IT'),
-    destinations: [
-      {
-        type: 'iban',
-        accountNumber: String(iban),
-        holderName: recipientName || 'Beneficiario'   // 👈 nome giusto qui
-      }
-    ],
-    reference: description || 'Pagamento bolletta'
+    recipient: {
+      name: recipientName || 'Beneficiario',
+      iban: String(iban)
+    },
+    remittanceInformation: {
+      type: 'UNSTRUCTURED',               // <- MAIUSCOLO esatto
+      value: description || 'Pagamento bolletta'
+    }
   };
 
   console.log('TINK PR payload:', payload);
