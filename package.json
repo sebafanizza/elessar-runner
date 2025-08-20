@@ -10,7 +10,8 @@
     "body-parser": "^1.20.2",
     "express": "^4.19.2",
     "node-fetch": "^3.3.2",
-    "twilio": "^4.21.0"
+    "twilio": "^4.21.0",
+    "stripe": "^14.25.0"
   },
   "engines": {
     "node": ">=18"
