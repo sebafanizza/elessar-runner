@@ -1,8 +1,9 @@
-// server.js — Elessar runner (CommonJS, pronto per Render)
+// server.js — Elessar runner (Stripe + Airtable + WhatsApp)
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const { twiml: { MessagingResponse } } = require('twilio');
+const Stripe = require('stripe');
 
 // ───────────────────────────────────────────────────────────────────────────────
 // fetch shim (per compatibilità; in Node >=18 spesso non serve)
@@ -11,11 +12,19 @@ if (typeof fetch === 'undefined') {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Helpers Airtable
+// Config & helpers
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false })); // Twilio manda form-encoded
+app.use(bodyParser.json());
+
+const APP_URL = process.env.APP_URL || '';
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2024-04-10' });
+
+// Airtable helper
 async function airtableCreate(table, fields) {
   const baseId = process.env.AIRTABLE_BASE_ID;
   const apiKey = process.env.AIRTABLE_API_KEY;
-  if (!baseId || !apiKey) throw new Error('Airtable non configurato (AIRTABLE_BASE_ID / AIRTABLE_API_KEY)');
+  if (!baseId || !apiKey) throw new Error('Airtable non configurato');
 
   const url = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(table)}`;
   const res = await fetch(url, {
@@ -32,81 +41,11 @@ async function airtableCreate(table, fields) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Helpers Tink (scope corretti: payment:write payment:read)
-function ensureTinkEnv() {
-  const { TINK_CLIENT_ID, TINK_CLIENT_SECRET, TINK_REDIRECT_URI } = process.env;
-  if (!TINK_CLIENT_ID || !TINK_CLIENT_SECRET || !TINK_REDIRECT_URI) {
-    throw new Error('Tink non configurato: TINK_CLIENT_ID / TINK_CLIENT_SECRET / TINK_REDIRECT_URI');
-  }
-}
-
-async function tinkToken() {
-  ensureTinkEnv();
-  const { TINK_CLIENT_ID, TINK_CLIENT_SECRET } = process.env;
-  const res = await fetch('https://api.tink.com/api/v1/oauth/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: TINK_CLIENT_ID,
-      client_secret: TINK_CLIENT_SECRET,
-      scope: 'payment:write payment:read'
-    })
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error('Tink token error: ' + JSON.stringify(data));
-  return data.access_token;
-}
-
-// ✅ Payment Request Tink corretto: recipient + account.type + accountNumber + remittance
-async function tinkCreatePaymentRequest({ amountEur, iban, recipientName, description, market }) {
-  const access = await tinkToken();
-
-  const amountInt = Math.round(Number(String(amountEur).replace(',', '.'))); // usa interi (es. 12)
-
-  const payload = {
-    amount: amountInt,
-    currency: 'EUR',
-    market: market || (process.env.TINK_MARKET || 'IT'),
-    recipient: {
-      name: recipientName || 'Beneficiario',
-      account: {
-        type: 'iban',
-        accountNumber: String(iban)   // 👈 questo è il campo che mancava
-      }
-    },
-    remittanceInformation: {
-      type: 'UNSTRUCTURED',
-      value: description || 'Pagamento bolletta'
-    }
-  };
-
-  console.log('TINK PR payload:', payload);
-
-  const res = await fetch('https://api.tink.com/api/v1/payments/requests', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${access}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-
-  const data = await res.json();
-  if (!res.ok) {
-    console.error('TINK PR error body:', data);
-    throw new Error('Create payment request error: ' + JSON.stringify(data));
-  }
-  return { id: data.id };
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
-const app = express();
-app.use(bodyParser.urlencoded({ extended: false })); // Twilio → form-encoded
-app.use(bodyParser.json());
-
-// Health / Ping
+// Health
 app.get('/', (_req, res) => res.send('Elessar runner ok'));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// Test Airtable (crea una riga finta su Jobs)
+// Test Airtable
 app.get('/test-airtable', async (_req, res) => {
   try {
     const out = await airtableCreate('Jobs', {
@@ -118,81 +57,96 @@ app.get('/test-airtable', async (_req, res) => {
   }
 });
 
-// Stub pagamento (pagina finta che rimbalza alla callback)
-app.get('/pay-bolletta-test', (req, res) => {
-  const { importo = '49', iban = 'IT60X0542811101000000123456', ente = 'Fornitore Luce', scadenza = '2025-09-10' } = req.query;
-  const url = new URL('/tink/callback', process.env.APP_URL || 'https://example.com');
-  url.searchParams.set('status', 'ok');
-  url.searchParams.set('ente', ente);
-  url.searchParams.set('importo', importo);
-  url.searchParams.set('iban', iban);
-  url.searchParams.set('scadenza', scadenza);
-  res.set('Content-Type', 'text/html; charset=utf-8').send(`
-    <html><body style="font-family:system-ui;padding:24px">
-      <h3>Autorizza pagamento (STUB)</h3>
-      <p>Ente: <b>${ente}</b><br/>Importo: <b>€${importo}</b><br/>Scadenza: <b>${scadenza}</b><br/>IBAN: <code>${iban}</code></p>
-      <a href="${url.toString()}" style="display:inline-block;padding:10px 14px;background:#16a34a;color:#fff;border-radius:8px;text-decoration:none">Autorizza</a>
-    </body></html>
-  `);
-});
-
-// Pagamento reale: genera Payment Request e reindirizza a Tink Link
-app.get('/pay-bolletta', async (req, res) => {
+// ───────────────────────────────────────────────────────────────────────────────
+// STRIPE: crea Checkout Session (pagamento carta)
+// URL: /pay-card?amount=49.90&ente=Fornitore%20Luce&iban=IT60X0542811101000000123456&descr=Bolletta%20Agosto
+app.get('/pay-card', async (req, res) => {
   try {
-    const { importo, iban, ente = 'Beneficiario', descr = 'Pagamento bolletta' } = req.query;
-    if (!importo || !iban) return res.status(400).send('Manca importo o IBAN');
+    if (!process.env.STRIPE_SECRET_KEY || !APP_URL) {
+      return res.status(500).send('Stripe non configurato: STRIPE_SECRET_KEY o APP_URL mancante.');
+    }
 
-    ensureTinkEnv();
-    const market = process.env.TINK_MARKET || 'IT';
+    const amountEur = String(req.query.amount || req.query.importo || '0').replace(',', '.');
+    const amountCents = Math.round(parseFloat(amountEur) * 100);
+    if (!amountCents || amountCents < 50) return res.status(400).send('Importo non valido.');
 
-    const { id } = await tinkCreatePaymentRequest({
-      amountEur: importo,
-      iban,
-      recipientName: ente,       // obbligatorio
-      description: descr,        // remittance semplice
-      market
+    const ente = (req.query.ente || 'Pagamento Elessar').toString();
+    const iban = (req.query.iban || '').toString();
+    const descr = (req.query.descr || 'Pagamento').toString();
+
+    // La descrizione del prodotto include l’ente
+    const productName = `Pagamento bolletta - ${ente}`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      currency: 'eur',
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          product_data: { name: productName },
+          unit_amount: amountCents
+        },
+        quantity: 1
+      }],
+      metadata: { ente, iban, descr },
+      success_url: `${APP_URL}/stripe/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${APP_URL}/stripe/cancel`
     });
 
-    const link = tinkPaymentLink(id, market);
-    return res.redirect(link);
+    return res.redirect(session.url);
   } catch (e) {
-    return res.status(500).send('Errore Tink: ' + e.message);
+    console.error('Stripe create session error:', e);
+    return res.status(500).send('Errore Stripe: ' + e.message);
   }
 });
 
-// Callback Tink: salva ricevuta
-app.get('/tink/callback', async (req, res) => {
+// Success page: conferma e salva su Airtable (Receipts)
+app.get('/stripe/success', async (req, res) => {
   try {
-    const paymentRequestId = req.query.payment_request_id || req.query.paymentRequestId || null;
-    const { ente = 'Sconosciuto', importo = '0', iban = '', scadenza = '' } = req.query;
+    const sid = req.query.session_id;
+    if (!sid) return res.status(400).send('Manca session_id.');
 
-    let status = 'pending';
-    if (paymentRequestId) {
-      try { status = await tinkGetStatus(paymentRequestId); } catch (_) {}
-    }
+    const session = await stripe.checkout.sessions.retrieve(sid, { expand: ['payment_intent'] });
+
+    const paid = session.payment_status === 'paid' || (session.payment_intent && session.payment_intent.status === 'succeeded');
+    const amount = (session.amount_total || 0) / 100;
+    const md = session.metadata || {};
 
     await airtableCreate('Receipts', {
-      Ente: ente,
-      Importo: Number(String(importo).replace(',', '.')),
-      IBAN: iban,
-      Scadenza: scadenza,
-      PISP_ID: paymentRequestId || 'stub',
-      Status: status
+      Ente: md.ente || 'Sconosciuto',
+      Importo: amount,
+      IBAN: md.iban || '',
+      Scadenza: '',                       // opzionale
+      PISP_ID: session.id,                // usiamo id sessione come riferimento
+      Status: paid ? 'paid' : 'pending'
     });
 
     res.set('Content-Type', 'text/html; charset=utf-8').send(`
       <html><body style="font-family:system-ui;padding:24px">
-        <h3>Pagamento ${status === 'paid' ? 'riuscito ✅' : 'in lavorazione ⏳'}</h3>
-        <p>Registrato in Airtable → Receipts.</p>
-        <a href="${process.env.APP_URL || '/'}" style="display:inline-block;margin-top:12px">Torna all'app</a>
+        <h3>Pagamento ${paid ? 'riuscito ✅' : 'in lavorazione ⏳'}</h3>
+        <p>Ricevuta registrata in Airtable → Receipts.</p>
+        <a href="${APP_URL}" style="display:inline-block;margin-top:12px">Torna all'app</a>
       </body></html>
     `);
   } catch (e) {
-    res.status(500).send('Errore callback: ' + e.message);
+    console.error('Stripe success error:', e);
+    res.status(500).send('Errore success: ' + e.message);
   }
 });
 
-// Webhook WhatsApp (routing base)
+// Facoltativo: pagina cancel
+app.get('/stripe/cancel', (_req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8').send(`
+    <html><body style="font-family:system-ui;padding:24px">
+      <h3>Pagamento annullato ❌</h3>
+      <a href="${APP_URL}" style="display:inline-block;margin-top:12px">Torna all'app</a>
+    </body></html>
+  `);
+});
+
+// ───────────────────────────────────────────────────────────────────────────────
+// WhatsApp webhook (routing base). Risponde con link Stripe
 app.post('/whatsapp/webhook', async (req, res) => {
   const from = req.body.From || '';
   const text = (req.body.Body || '').trim().toLowerCase();
@@ -205,18 +159,14 @@ app.post('/whatsapp/webhook', async (req, res) => {
 
   try {
     await airtableCreate('Jobs', { Tipo: tipo, Stato: 'nuovo', Utente: from, Dettagli: text });
-  } catch (e) {
-    console.error('Airtable error:', e.message);
-  }
+  } catch (e) { console.error('Airtable error:', e.message); }
 
   const reply = new MessagingResponse();
   const msg = reply.message();
-  const base = process.env.APP_URL || '';
 
   if (tipo === 'bolletta') {
-    const realUrl = `${base}/pay-bolletta?importo=12&iban=IT60X0542811101000000123456&ente=Fornitore%20Luce&descr=Bolletta`;
-    const stubUrl = `${base}/pay-bolletta-test?importo=12&iban=IT60X0542811101000000123456&ente=Fornitore%20Luce&scadenza=2025-09-10`;
-    msg.body(`Ok 👌 manda PDF/foto della bolletta.\nProva ora:\n• 🔵 Reale (Tink): ${realUrl}\n• ⚪️ Rapido (stub): ${stubUrl}`);
+    const url = `${APP_URL}/pay-card?amount=12.00&ente=Fornitore%20Luce&iban=IT60X0542811101000000123456&descr=Bolletta`;
+    msg.body(`Ok 👌 manda PDF/foto della bolletta.\nPer pagare subito con carta: ${url}`);
   } else if (tipo === 'medico') {
     msg.body('Perfetto. Dimmi giorno/fascia oraria e provo a prenotare.');
   } else if (tipo === 'auto') {
