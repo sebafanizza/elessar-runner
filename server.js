@@ -223,3 +223,198 @@ app.post('/whatsapp/webhook', async (req, res) => {
 // ───────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Runner up on ' + PORT));
+
+// --- imports in alto (aggiungi se mancanti) ---
+import OpenAI from 'openai'; // se già presente ok
+import crypto from 'crypto';
+
+// Airtable via REST (niente librerie)
+const AIRTABLE_BASE = process.env.AIRTABLE_BASE_ID;
+const AIRTABLE_KEY  = process.env.AIRTABLE_API_KEY;
+
+// DEMO guard: non permettere chiavi live in demo
+function assertDemoGuard() {
+  if (process.env.APP_MODE === 'demo' &&
+      process.env.STRIPE_SECRET_KEY &&
+      process.env.STRIPE_SECRET_KEY.startsWith('sk_live_')) {
+    throw new Error('Demo mode attivo: rimuovi chiavi LIVE da Render.');
+  }
+}
+assertDemoGuard();
+
+// helper Airtable
+async function airtableCreate(table, fields) {
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE}/${encodeURIComponent(table)}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${AIRTABLE_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ records: [{ fields }] })
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    console.error('Airtable error:', t);
+    throw new Error('Airtable create failed');
+  }
+  const json = await res.json();
+  return json.records?.[0]?.id;
+}
+
+// build pay link
+function buildPayLink({ amount, ente, iban, descr, scadenza }) {
+  const u = new URL('/pay-card', process.env.APP_URL);
+  if (amount) u.searchParams.set('amount', String(amount).replace(',', '.'));
+  if (ente) u.searchParams.set('ente', ente);
+  if (iban) u.searchParams.set('iban', iban);
+  if (descr) u.searchParams.set('descr', descr);
+  if (scadenza) u.searchParams.set('scadenza', scadenza);
+  return u.toString();
+}
+
+// parser semplici
+function parseAmount(s) {
+  const m = (s || '').replace(/[^\d.,]/g, '').replace(/\./g, '').replace(',', '.');
+  const n = parseFloat(m);
+  return Number.isFinite(n) ? n : undefined;
+}
+function normalizeIban(s) {
+  if (!s) return undefined;
+  return s.replace(/\s+/g, '').toUpperCase();
+}
+function parseDateISO(s) {
+  if (!s) return undefined;
+  // accetta YYYY-MM-DD o DD/MM/YYYY
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^(\d{2})[\/.-](\d{2})[\/.-](\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  return undefined;
+}
+
+// --- MEMORY semplice per chat WhatsApp (per MVP va benissimo) ---
+const sessions = new Map(); // key: from, value: {step, data, ts}
+const STEPS = ['ente','importo','iban','scadenza'];
+
+// risponditore Twilio
+function replyTwilio(res, msg) {
+  const twiml = new (require('twilio').twiml.MessagingResponse)();
+  twiml.message(msg);
+  res.type('text/xml').send(twiml.toString());
+}
+
+// --- Webhook WhatsApp (sostituisci/integra la tua rotta esistente) ---
+app.post('/whatsapp/webhook', express.urlencoded({ extended: false }), async (req, res) => {
+  try {
+    const from = req.body.From || 'unknown';
+    const body = (req.body.Body || '').trim();
+
+    // entrypoint
+    if (/^bolletta\b/i.test(body) || !sessions.get(from)) {
+      sessions.set(from, { step: 0, data: {}, ts: Date.now() });
+      return replyTwilio(res,
+        '🧪 DEMO • Nessun addebito\n' +
+        'Ok, ti aiuto a preparare il pagamento della bolletta.\n' +
+        '1/4 • Scrivi *Ente* (es. Enel, A2A, Gori…)\n\n' +
+        '_Puoi sempre digitare "annulla" per ricominciare_.'
+      );
+    }
+
+    // annulla
+    if (/^annulla$/i.test(body)) {
+      sessions.delete(from);
+      return replyTwilio(res, 'Flusso annullato. Scrivi *bolletta* per ricominciare.');
+    }
+
+    // recupera sessione
+    const s = sessions.get(from) || { step: 0, data: {} };
+
+    // step corrente
+    const step = STEPS[s.step];
+
+    if (step === 'ente') {
+      s.data.ente = body;
+      s.step++;
+      sessions.set(from, s);
+      return replyTwilio(res, '2/4 • Importo (es. 49,90)');
+    }
+
+    if (step === 'importo') {
+      const amt = parseAmount(body);
+      if (!amt) return replyTwilio(res, 'Formato importo non valido. Esempio: 49,90');
+      s.data.amount = amt;
+      s.step++;
+      sessions.set(from, s);
+      return replyTwilio(res, '3/4 • IBAN del fornitore (es. IT60 X054 2811 1010 0000 123456)');
+    }
+
+    if (step === 'iban') {
+      const iban = normalizeIban(body);
+      if (!iban || !/^IT\d{2}[A-Z]\d{10}[0-9A-Z]{12}$/.test(iban))
+        return replyTwilio(res, 'IBAN non valido. Invia un IBAN italiano completo (es. IT60X0542811101000000123456).');
+      s.data.iban = iban;
+      s.step++;
+      sessions.set(from, s);
+      return replyTwilio(res, '4/4 • Scadenza (YYYY-MM-DD oppure DD/MM/YYYY). Se non c’è, scrivi "nessuna".');
+    }
+
+    if (step === 'scadenza') {
+      let d = undefined;
+      if (!/^nessuna$/i.test(body)) d = parseDateISO(body);
+      if (!d && !/^nessuna$/i.test(body)) return replyTwilio(res, 'Data non valida. Esempi: 2025-09-10 oppure 10/09/2025');
+      s.data.scadenza = d;
+      // chiusura
+      const { ente, amount, iban, scadenza } = s.data;
+      const descr = 'Bolletta';
+      const link = buildPayLink({ amount, ente, iban, descr, scadenza });
+
+      // salva su Airtable come DEMO
+      try {
+        await airtableCreate('Receipts', {
+          Ente: ente,
+          Importo: amount,
+          IBAN: iban,
+          Scadenza: scadenza || null,
+          Status: 'demo',
+          PISP_ID: `demo_${Date.now()}`
+        });
+      } catch (e) {
+        console.error('Airtable save failed (demo):', e.message);
+      }
+
+      sessions.delete(from);
+
+      // messaggio finale
+      const msg =
+`🧪 DEMO • Nessun addebito
+Ecco il riepilogo:
+• Ente: ${ente}
+• Importo: € ${amount.toFixed(2)}
+• IBAN: ${iban}
+• Scadenza: ${scadenza || '—'}
+
+👉 Link di prova (solo ambiente test):
+${link}
+
+Per il pagamento reale: usa il sito/app del fornitore o bonifico al loro IBAN.
+Scrivi *bolletta* per inserirne un’altra.`;
+      return replyTwilio(res, msg);
+    }
+
+    // fallback
+    replyTwilio(res, 'Non ho capito. Scrivi *bolletta* per iniziare, oppure *annulla* per uscire.');
+  } catch (err) {
+    console.error('WA webhook error:', err);
+    return replyTwilio(res, 'Si è verificato un errore. Scrivi *bolletta* per riprovare.');
+  }
+});
+
+// --- Guardiano su /pay-card (opzionale ma consigliato) ---
+app.use((req, res, next) => {
+  if (process.env.APP_MODE === 'demo' &&
+      process.env.STRIPE_SECRET_KEY?.startsWith('sk_live_')) {
+    return res.status(403).send('Demo attivo: pagamenti LIVE disabilitati.');
+  }
+  next();
+});
+
