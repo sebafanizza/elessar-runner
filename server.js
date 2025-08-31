@@ -1,4 +1,4 @@
-// server.js — Elessar MVP DEMO (WhatsApp step → link Stripe test → log Airtable)
+// server.js — Elessar MVP DEMO + sessioni WhatsApp persistenti su Airtable
 // ES Module (package.json: { "type": "module" })
 
 import express from 'express';
@@ -11,7 +11,12 @@ const APP_URL = process.env.APP_URL || `http://localhost:${PORT}`;
 const APP_MODE = process.env.APP_MODE || 'demo';
 const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || '';
 const AIRTABLE_BASE = process.env.AIRTABLE_BASE_ID || '';
-const AIRTABLE_KEY  = process.env.AIRTABLE_API_KEY || '';
+const AIRTABLE_TOKEN = process.env.AIRTABLE_PAT || process.env.AIRTABLE_API_KEY || '';
+
+// tabelle Airtable
+const AT_TABLE_JOBS = process.env.AT_TABLE_JOBS || 'Jobs';
+const AT_TABLE_RECEIPTS = process.env.AT_TABLE_RECEIPTS || 'Receipts';
+const AT_TABLE_SESSIONS = process.env.AT_TABLE_SESSIONS || 'Sessions';
 
 // Guard-rail: in DEMO rifiuta chiavi live
 if (APP_MODE === 'demo' && STRIPE_KEY.startsWith('sk_live_')) {
@@ -65,24 +70,98 @@ function buildPayLink({ amount, ente, iban, descr, scadenza }) {
   if (scadenza) u.searchParams.set('scadenza', scadenza);
   return u.toString();
 }
-async function airtableCreate(table, fields) {
-  if (!AIRTABLE_BASE || !AIRTABLE_KEY) return null; // silenzioso in assenza env
+
+// ---------- Airtable helpers ----------
+async function atCreate(table, fields = {}) {
+  if (!AIRTABLE_BASE || !AIRTABLE_TOKEN) {
+    console.error('Airtable missing env:', { AIRTABLE_BASE: !!AIRTABLE_BASE, AIRTABLE_TOKEN: !!AIRTABLE_TOKEN });
+    return null;
+  }
   const url = `https://api.airtable.com/v0/${AIRTABLE_BASE}/${encodeURIComponent(table)}`;
   const r = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${AIRTABLE_KEY}`,
+      Authorization: `Bearer ${AIRTABLE_TOKEN}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ records: [{ fields }] }),
   });
+  const text = await r.text();
   if (!r.ok) {
-    const t = await r.text();
-    console.error('Airtable error:', t);
+    console.error('Airtable error:', r.status, text);
     return null;
   }
+  try {
+    const j = JSON.parse(text);
+    return j.records?.[0]?.id || null;
+  } catch (e) {
+    console.error('Airtable parse error:', e.message, text);
+    return null;
+  }
+}
+async function atUpdate(table, id, fields = {}) {
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE}/${encodeURIComponent(table)}`;
+  const r = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ records: [{ id, fields }] }),
+  });
+  return r.ok;
+}
+async function atDelete(table, id) {
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE}/${encodeURIComponent(table)}/${id}`;
+  const r = await fetch(url, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
+  });
+  return r.ok;
+}
+function q(param) { return encodeURIComponent(param); }
+function formulaEq(field, value) {
+  // usa stringhe con doppi apici; escape dei doppi apici
+  const v = String(value).replace(/"/g, '\\"');
+  return `({${field}}="${v}")`;
+}
+async function atFindOneByField(table, field, value) {
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE}/${encodeURIComponent(table)}?maxRecords=1&filterByFormula=${q(formulaEq(field, value))}`;
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
+  });
   const j = await r.json();
-  return j.records?.[0]?.id || null;
+  const rec = j.records?.[0];
+  return rec ? { id: rec.id, fields: rec.fields || {} } : null;
+}
+
+// ---------- Sessions (persistenti su Airtable) ----------
+async function getSession(from) {
+  const rec = await atFindOneByField(AT_TABLE_SESSIONS, 'From', from);
+  if (!rec) return null;
+  const step = Number(rec.fields.Step ?? 0);
+  const dataRaw = rec.fields.Data || '{}';
+  const ts = Number(rec.fields.TS ?? 0);
+  let data = {};
+  try { data = JSON.parse(dataRaw); } catch {}
+  // timeout: se la sessione è vecchia > 30 min, considerala scaduta
+  if (Date.now() - ts > 30 * 60 * 1000) return null;
+  return { id: rec.id, step, data, ts };
+}
+async function setSession(from, { step, data }) {
+  const now = Date.now();
+  const existing = await atFindOneByField(AT_TABLE_SESSIONS, 'From', from);
+  const fields = { From: from, Step: step, Data: JSON.stringify(data || {}), TS: now };
+  if (existing) {
+    await atUpdate(AT_TABLE_SESSIONS, existing.id, fields);
+    return existing.id;
+  } else {
+    return await atCreate(AT_TABLE_SESSIONS, fields);
+  }
+}
+async function deleteSession(from) {
+  const existing = await atFindOneByField(AT_TABLE_SESSIONS, 'From', from);
+  if (existing) await atDelete(AT_TABLE_SESSIONS, existing.id);
 }
 
 // ---------- Health ----------
@@ -90,8 +169,7 @@ app.get('/', (_req, res) => {
   res.status(200).send('Elessar runner ok');
 });
 
-// ---------- WhatsApp (Sandbox) MVP: flusso a 4 step ----------
-const sessions = new Map(); // key: From (numero mittente), value: { step, data, ts }
+// ---------- WhatsApp (Sandbox) MVP con sessioni persistenti ----------
 const STEPS = ['ente', 'importo', 'iban', 'scadenza'];
 
 app.post('/whatsapp/webhook', async (req, res) => {
@@ -100,8 +178,8 @@ app.post('/whatsapp/webhook', async (req, res) => {
     const body = (req.body.Body || '').trim();
 
     // start / reset
-    if (/^bolletta\b/i.test(body) || !sessions.get(from)) {
-      sessions.set(from, { step: 0, data: {}, ts: Date.now() });
+    if (/^bolletta\b/i.test(body)) {
+      await setSession(from, { step: 0, data: {} });
       return replyTwilio(
         res,
         '🧪 DEMO • Nessun addebito\n' +
@@ -112,17 +190,28 @@ app.post('/whatsapp/webhook', async (req, res) => {
     }
 
     if (/^annulla$/i.test(body)) {
-      sessions.delete(from);
+      await deleteSession(from);
       return replyTwilio(res, 'Flusso annullato. Scrivi *bolletta* per ricominciare.');
     }
 
-    const s = sessions.get(from) || { step: 0, data: {} };
+    let s = await getSession(from);
+    if (!s) {
+      // nessuna sessione valida → ricomincia
+      await setSession(from, { step: 0, data: {} });
+      return replyTwilio(
+        res,
+        '🧪 DEMO • Nessun addebito\n' +
+          'Sessione nuova.\n' +
+          '1/4 • Scrivi *Ente* (es. Enel, A2A, Gori…)\n'
+      );
+    }
+
     const step = STEPS[s.step];
 
     if (step === 'ente') {
       s.data.ente = body;
       s.step++;
-      sessions.set(from, s);
+      await setSession(from, { step: s.step, data: s.data });
       return replyTwilio(res, '2/4 • Importo (es. 49,90)');
     }
 
@@ -131,7 +220,7 @@ app.post('/whatsapp/webhook', async (req, res) => {
       if (!amt) return replyTwilio(res, 'Formato importo non valido. Esempio: 49,90');
       s.data.amount = amt;
       s.step++;
-      sessions.set(from, s);
+      await setSession(from, { step: s.step, data: s.data });
       return replyTwilio(res, '3/4 • IBAN del fornitore (es. IT60 X054 2811 1010 0000 123456)');
     }
 
@@ -141,7 +230,7 @@ app.post('/whatsapp/webhook', async (req, res) => {
         return replyTwilio(res, 'IBAN non valido. Invia un IBAN italiano completo (es. IT60X0542811101000000123456).');
       s.data.iban = iban;
       s.step++;
-      sessions.set(from, s);
+      await setSession(from, { step: s.step, data: s.data });
       return replyTwilio(res, '4/4 • Scadenza (YYYY-MM-DD oppure DD/MM/YYYY). Se non c’è, scrivi "nessuna".');
     }
 
@@ -158,7 +247,7 @@ app.post('/whatsapp/webhook', async (req, res) => {
 
       // Log Airtable in DEMO
       try {
-        await airtableCreate('Receipts', {
+        await atCreate(AT_TABLE_RECEIPTS, {
           Ente: ente,
           Importo: amount,
           IBAN: iban,
@@ -170,7 +259,8 @@ app.post('/whatsapp/webhook', async (req, res) => {
         console.error('Airtable save failed (demo):', e.message);
       }
 
-      sessions.delete(from);
+      await deleteSession(from);
+
       const msg =
         `🧪 DEMO • Nessun addebito\n` +
         `Ecco il riepilogo:\n` +
@@ -229,14 +319,7 @@ app.get('/pay-card', async (req, res) => {
           },
         },
       ],
-      // Metadati utili in Dashboard
-      metadata: {
-        ente,
-        iban,
-        descr,
-        scadenza: scadenza || '',
-        app_mode: APP_MODE,
-      },
+      metadata: { ente, iban, descr, scadenza: scadenza || '', app_mode: APP_MODE },
     });
 
     return res.redirect(303, session.url);
@@ -250,18 +333,9 @@ app.get('/pay-card', async (req, res) => {
 app.get('/stripe/success', async (req, res) => {
   const sid = req.query.session_id;
   if (!sid) return res.status(400).send('Manca session_id.');
-
-  // In DEMO segniamo come demo anche se "succeeded" in test
   try {
-    const recordId = await airtableCreate('Receipts', {
-      Status: 'demo',
-      PISP_ID: String(sid),
-    });
-    console.log('Airtable saved demo receipt:', recordId);
-  } catch (e) {
-    console.error('Airtable save after success failed:', e.message);
-  }
-
+    await atCreate(AT_TABLE_RECEIPTS, { Status: 'demo', PISP_ID: String(sid) });
+  } catch (e) {}
   res
     .status(200)
     .send(
@@ -287,11 +361,7 @@ app.get('/stripe/cancel', (_req, res) => {
 // ---------- Test Airtable ----------
 app.get('/test-airtable', async (_req, res) => {
   try {
-    const id = await airtableCreate('Jobs', {
-      Tipo: 'altro',
-      Stato: 'nuovo',
-      Note: `ping ${new Date().toISOString()}`,
-    });
+    const id = await atCreate(AT_TABLE_JOBS, { Tipo: 'altro', Stato: 'nuovo', Note: `ping ${new Date().toISOString()}` });
     res.status(200).send(`OK: creato record Jobs ${id || '(no id)'}`);
   } catch (e) {
     res.status(500).send('Airtable non configurato o errore.');
