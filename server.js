@@ -436,6 +436,67 @@ app.get("/test-airtable", async (_req, res) => {
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
+// -------------------------------------------------------------
+// Receipts dashboard (HTML)
+app.get("/receipts", async (_req, res) => {
+  try {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+      return res.status(500).send("Airtable non configurato");
+    }
+
+    const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
+      AIRTABLE_TABLE_JOBS
+    )}?sort[0][field]=Timestamp&sort[0][direction]=desc`;
+
+    const r = await fetch2(url, {
+      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` },
+    });
+    const data = await r.json();
+
+    const rows = (data.records || [])
+      .map((rec) => {
+        const f = rec.fields || {};
+        return `<tr>
+          <td>${f.Name || ""}</td>
+          <td>${f.Amount ? "€ " + f.Amount.toFixed(2) : ""}</td>
+          <td>${f.Ente || ""}</td>
+          <td>${f.Scadenza || ""}</td>
+          <td>${f.Status || ""}</td>
+          <td>${f.Timestamp || ""}</td>
+        </tr>`;
+      })
+      .join("");
+
+    const html = `
+      <html><head>
+        <meta charset="utf-8"/>
+        <title>Receipts - Elessar</title>
+        <style>
+          body { font-family: sans-serif; margin: 2em; }
+          table { border-collapse: collapse; width: 100%; }
+          th, td { border: 1px solid #ddd; padding: 8px; }
+          th { background: #f4f4f4; }
+        </style>
+      </head>
+      <body>
+        <h2>Receipts (Airtable)</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th><th>Importo</th><th>Ente</th><th>Scadenza</th><th>Status</th><th>Timestamp</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </body></html>
+    `;
+    res.set("Content-Type", "text/html; charset=utf-8");
+    return res.send(html);
+  } catch (err) {
+    console.error("Receipts error:", err);
+    return res.status(500).send("Errore caricamento receipts");
+  }
+});
 
 // -------------------------------------------------------------
 // Avvio server
