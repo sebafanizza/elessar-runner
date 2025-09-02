@@ -1,6 +1,5 @@
 // server.js (ESM, Node 18+)
 // -------------------------------------------------------------
-// Dipendenze core
 import express from "express";
 import bodyParser from "body-parser";
 import multer from "multer";
@@ -10,11 +9,9 @@ import OpenAI from "openai";
 import Stripe from "stripe";
 import path from "node:path";
 
-// Nota: su Node 18+ esiste fetch nativo. NON serve "node-fetch".
 const fetch2 = globalThis.fetch;
 
 // -------------------------------------------------------------
-// Inizializzazione app e client SDK
 const app = express();
 app.use(bodyParser.json({ limit: "15mb" }));
 app.use(bodyParser.urlencoded({ extended: true, limit: "15mb" }));
@@ -162,7 +159,7 @@ async function fetchRemoteFile(url) {
 app.get("/", (_req, res) => res.send("Elessar runner ok"));
 
 // -------------------------------------------------------------
-// Stripe: crea Checkout e reindirizza (query: amount, ente, iban, descr, scadenza)
+// Stripe
 app.get("/pay-card", async (req, res) => {
   try {
     if (!stripe) return res.status(500).send("Stripe non configurato");
@@ -237,7 +234,7 @@ app.get("/stripe/success", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// OCR: upload file (multipart "file")
+// OCR: upload file
 app.post("/ocr/analyze", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Nessun file inviato" });
@@ -277,7 +274,7 @@ app.post("/ocr/analyze", upload.single("file"), async (req, res) => {
   }
 });
 
-// OCR: da URL (es. MediaUrl0 Twilio)
+// OCR: da URL
 app.get("/ocr/analyze-by-url", async (req, res) => {
   try {
     const { url } = req.query;
@@ -320,7 +317,7 @@ app.get("/ocr/analyze-by-url", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// WhatsApp (Twilio) webhook: OCR su media, risposte rapide
+// WhatsApp (Twilio) webhook
 function replyTwilio(res, message) {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response><Message>${String(message).replace(/&/g, "&amp;").replace(/</g, "&lt;")}</Message></Response>`;
@@ -333,7 +330,6 @@ app.post("/whatsapp/webhook", express.urlencoded({ extended: false }), async (re
     const body = req.body.Body || "";
     const numMedia = parseInt(req.body.NumMedia || "0", 10);
 
-    // Se arriva una foto/PDF
     if (numMedia > 0) {
       const mediaUrl = req.body.MediaUrl0;
       const out = await (await fetch2(
@@ -355,7 +351,6 @@ app.post("/whatsapp/webhook", express.urlencoded({ extended: false }), async (re
       }
     }
 
-    // Testo
     const txt = body.trim().toLowerCase();
     if (txt.includes("ciao")) return replyTwilio(res, "Ciao! Inviami la foto o il PDF della bolletta per creare il link di pagamento.");
     if (txt.includes("bolletta"))
@@ -377,7 +372,7 @@ app.post("/whatsapp/webhook", express.urlencoded({ extended: false }), async (re
 });
 
 // -------------------------------------------------------------
-// Airtable test: inserisce una riga su Jobs (se configurato)
+// Airtable test
 app.get("/test-airtable", async (_req, res) => {
   try {
     if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
@@ -422,13 +417,3 @@ app.get("/test-airtable", async (_req, res) => {
 // Avvio server
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Runner up on ${PORT}`));
-
-// -------------------------------------------------------------
-// Helper: fetch remoto per OCR by URL
-async function fetchRemoteFile(url) {
-  const r = await fetch2(url);
-  if (!r.ok) throw new Error(`Download failed ${r.status}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  const contentType = r.headers.get("content-type") || "application/octet-stream";
-  return { buf, contentType };
-}
