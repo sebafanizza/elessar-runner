@@ -3,7 +3,7 @@
 import express from "express";
 import bodyParser from "body-parser";
 import multer from "multer";
-import pdfParse from "pdf-parse";
+import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { isValid as isValidIban } from "iban";
 import OpenAI from "openai";
 import Stripe from "stripe";
