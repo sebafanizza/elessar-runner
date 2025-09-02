@@ -433,6 +433,251 @@ app.get('/test-airtable', async (_req, res) => {
     res.status(500).send('Airtable non configurato o errore.');
   }
 });
+// --- IMPORT ---
+import express from "express";
+import bodyParser from "body-parser";
+import multer from "multer";
+import fetch from "node-fetch";
+import pdfParse from "pdf-parse";
+import { isValid as isValidIban } from "iban";
+import OpenAI from "openai";
+import path from "node:path";
 
-// ---------- Start ----------
-app.listen(PORT, () => console.log('Runner up on', PORT, 'mode:', APP_MODE));
+// --- INIT ---
+const app = express();
+app.use(bodyParser.json({ limit: "15mb" }));
+app.use(bodyParser.urlencoded({ extended: true, limit: "15mb" }));
+
+const upload = multer({ storage: multer.memoryStorage() });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Utility: crea link pagamento già pronto
+function buildPayLink({ amount, ente, iban, descr, scadenza }) {
+  const base = `${process.env.BASE_URL || "https://elessar-runner-2.onrender.com"}/pay-card`;
+  const params = new URLSearchParams();
+  if (amount) params.set("amount", String(amount).replace(",", "."));
+  if (ente) params.set("ente", ente);
+  if (iban) params.set("iban", iban);
+  if (descr) params.set("descr", descr);
+  if (scadenza) params.set("scadenza", scadenza); // YYYY-MM-DD
+  return `${base}?${params.toString()}`;
+}
+
+// Estrazione “grezza” da testo: fallback/regole rapide
+function extractByRegex(text) {
+  const clean = text.replace(/\s+/g, " ").trim();
+
+  // IBAN (EU)
+  const ibanMatch = clean.match(/[A-Z]{2}\d{2}[A-Z0-9]{1,30}/i);
+  const iban = ibanMatch ? ibanMatch[0].toUpperCase() : undefined;
+  const ibanValid = iban && isValidIban(iban) ? iban : undefined;
+
+  // Importo: prende 1234,56 o 1.234,56 o 1234.56
+  const amtMatch = clean.match(/(?<!\d)(\d{1,3}([.,]\d{3})*|\d+)([.,]\d{2})(?!\d)/);
+  let amount;
+  if (amtMatch) {
+    const raw = amtMatch[0].replace(/\./g, "").replace(",", ".");
+    amount = parseFloat(raw);
+  }
+
+  // Scadenza: YYYY-MM-DD o DD/MM/YYYY
+  let scadenza;
+  const iso = clean.match(/\b20\d{2}-\d{2}-\d{2}\b/);
+  const ita = clean.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](20\d{2})\b/);
+  if (iso) scadenza = iso[0];
+  else if (ita) {
+    const [ , d, m, y ] = ita;
+    const dd = String(d).padStart(2,"0"), mm = String(m).padStart(2,"0");
+    scadenza = `${y}-${mm}-${dd}`;
+  }
+
+  // Ente: heuristica (riga col “Bolletta”/”Fattura” o una riga in maiuscolo in testa)
+  let ente;
+  const candidates = (text.split(/\n|\r/g)).map(s => s.trim()).filter(Boolean);
+  ente = candidates.find(s => /enel|hera|iren|a2a|abbanoa|acea|acqua|gas|luce|fattura|bolletta/i.test(s));
+  if (!ente) {
+    // prendi una riga corta in alto che sembri ragionevole
+    ente = candidates.slice(0, 10).find(s => s.length > 3 && s.length < 50);
+  }
+  if (ente) {
+    // pulizia ente
+    ente = ente.replace(/^(fattura|bolletta)[:\s-]*/i,"").trim();
+  }
+
+  return { amount, iban: ibanValid, scadenza, ente };
+}
+
+// Vision prompt per estrazione strutturata
+function ocrSystemPrompt() {
+  return `You are a meticulous OCR & data extraction engine for Italian utility bills.
+Return ONLY valid JSON with keys: ente, iban, amount, scadenza, descr.
+- amount: number in euros with dot decimal (e.g., 49.90). If multiple, pick the bill TOTAL to pay.
+- scadenza: due date in YYYY-MM-DD if present, else null.
+- iban: payee IBAN if present and valid, else null.
+- ente: merchant/utility/provider name (short).
+- descr: short description like "Bolletta Agosto" if guessable (else null).`;
+}
+
+// Chiama OpenAI Vision su immagine (Buffer -> base64 data URL)
+async function visionExtractFromImageBuffer(buf, mime="image/png") {
+  const b64 = buf.toString("base64");
+  const dataUrl = `data:${mime};base64,${b64}`;
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: ocrSystemPrompt() },
+      { role: "user", content: [
+          { type: "text", text: "Estrarre i campi in JSON." },
+          { type: "image_url", image_url: { url: dataUrl } }
+        ]
+      }
+    ],
+    temperature: 0
+  });
+  const json = JSON.parse(resp.choices[0].message.content || "{}");
+  return json;
+}
+
+// Chiama OpenAI su testo (da PDF) per consolidare campi + fallback regex
+async function llmExtractFromText(text) {
+  const fallback = extractByRegex(text);
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: ocrSystemPrompt() },
+      { role: "user", content: `Testo OCR:\n${text}\n\nEstrai JSON come richiesto.` }
+    ],
+    temperature: 0
+  });
+  const ai = JSON.parse(resp.choices[0].message.content || "{}");
+
+  // merge intelligente: se LLM manca un campo, usa fallback
+  return {
+    ente: ai.ente || fallback.ente || null,
+    iban: (ai.iban && isValidIban(ai.iban) ? ai.iban : (fallback.iban || null)) || null,
+    amount: (typeof ai.amount === "number" && !isNaN(ai.amount)) ? ai.amount : (fallback.amount || null),
+    scadenza: ai.scadenza || fallback.scadenza || null,
+    descr: ai.descr || null
+  };
+}
+
+// Scarica file remoto (es. MediaUrl0 di WhatsApp) -> Buffer + mime
+async function fetchRemoteFile(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Download failed ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  const contentType = r.headers.get("content-type") || "application/octet-stream";
+  return { buf, contentType };
+}
+
+// --- ENDPOINT OCR: carica file o passa un URL ---
+// POST /ocr/analyze  (multipart "file")  OPPURE  GET /ocr/analyze?url=<https://...>
+app.post("/ocr/analyze", upload.single("file"), async (req, res) => {
+  try {
+    let buf, mime, filename;
+    if (req.file) {
+      buf = req.file.buffer;
+      mime = req.file.mimetype || "application/octet-stream";
+      filename = req.file.originalname || "upload";
+    } else {
+      return res.status(400).json({ error: "Nessun file. Usa form-data 'file'." });
+    }
+
+    let extracted;
+    if (mime.includes("pdf") || path.extname(filename).toLowerCase() === ".pdf") {
+      // PDF -> testo con pdf-parse
+      const parsed = await pdfParse(buf);
+      const text = parsed.text || "";
+      extracted = await llmExtractFromText(text);
+    } else if (mime.startsWith("image/")) {
+      // Immagini -> Vision
+      extracted = await visionExtractFromImageBuffer(buf, mime);
+    } else {
+      return res.status(415).json({ error: `Tipo file non supportato: ${mime}` });
+    }
+
+    // Validazioni leggere
+    if (extracted.iban && !isValidIban(extracted.iban)) extracted.iban = null;
+
+    // Crea descr se mancante
+    if (!extracted.descr) {
+      const guess = extracted.scadenza ? `Bolletta ${extracted.scadenza}` : "Bolletta";
+      extracted.descr = guess;
+    }
+
+    const payLink = buildPayLink({
+      amount: extracted.amount,
+      ente: extracted.ente,
+      iban: extracted.iban,
+      descr: extracted.descr,
+      scadenza: extracted.scadenza
+    });
+
+    return res.json({
+      ok: true,
+      data: extracted,
+      pay_link: payLink
+    });
+  } catch (err) {
+    console.error("OCR error:", err);
+    return res.status(500).json({ error: "OCR failure", details: err.message });
+  }
+});
+
+// Variante GET per URL remoto (es. media WhatsApp già pubblico)
+// /ocr/analyze-by-url?url=https://...
+app.get("/ocr/analyze-by-url", async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: "Parametro 'url' mancante" });
+
+    const { buf, contentType } = await fetchRemoteFile(url);
+    let extracted;
+
+    if (contentType.includes("pdf") || url.toLowerCase().endsWith(".pdf")) {
+      const parsed = await pdfParse(buf);
+      const text = parsed.text || "";
+      extracted = await llmExtractFromText(text);
+    } else if (contentType.startsWith("image/")) {
+      extracted = await visionExtractFromImageBuffer(buf, contentType);
+    } else {
+      return res.status(415).json({ error: `Tipo file non supportato: ${contentType}` });
+    }
+
+    if (extracted.iban && !isValidIban(extracted.iban)) extracted.iban = null;
+    if (!extracted.descr) extracted.descr = extracted.scadenza ? `Bolletta ${extracted.scadenza}` : "Bolletta";
+
+    const payLink = buildPayLink({
+      amount: extracted.amount,
+      ente: extracted.ente,
+      iban: extracted.iban,
+      descr: extracted.descr,
+      scadenza: extracted.scadenza
+    });
+
+    return res.json({ ok: true, data: extracted, pay_link: payLink });
+  } catch (err) {
+    console.error("OCR URL error:", err);
+    return res.status(500).json({ error: "OCR failure", details: err.message });
+  }
+});
+
+// --- (opzionale) integrazione rapida WhatsApp: se arriva una media, OCR -> link ---
+// Dentro al tuo webhook Twilio, aggiungi qualcosa così:
+// if (numMedia > 0) {
+//   const mediaUrl = req.body.MediaUrl0;
+//   const result = await fetch(`${baseUrl}/ocr/analyze-by-url?url=${encodeURIComponent(mediaUrl)}`).then(r=>r.json());
+//   const reply = result.ok
+//     ? `Ho letto il documento:\n- Ente: ${result.data.ente || "-" }\n- IBAN: ${result.data.iban || "-" }\n- Importo: ${result.data.amount || "-" }\n- Scadenza: ${result.data.scadenza || "-" }\n\nPaga qui: ${result.pay_link}`
+//     : "Non sono riuscito a leggere il file. Riprova con una foto più chiara o un PDF.";
+//   return replyTwilio(res, reply);
+// }
+
+// --- START SERVER ---
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Runner up on ${PORT}`));
+
+
