@@ -145,14 +145,38 @@ async function llmExtractFromText(text) {
     descr: ai.descr || null,
   };
 }
-
 async function fetchRemoteFile(url) {
-  const r = await fetch2(url);
+  const u = new URL(url);
+  const headers = {};
+
+  // Twilio media require Basic Auth
+  if (u.hostname.endsWith("twilio.com")) {
+    const sid = process.env.TWILIO_ACCOUNT_SID;
+    const tok = process.env.TWILIO_AUTH_TOKEN;
+    if (!sid || !tok) {
+      throw new Error("Twilio creds missing: set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN");
+    }
+    headers.Authorization = "Basic " + Buffer.from(`${sid}:${tok}`).toString("base64");
+  }
+
+  // Alcuni server rifiutano richieste senza UA
+  headers["User-Agent"] = "ElessarRunner/1.0 (+https://elessar-runner-2.onrender.com)";
+
+  const r = await fetch(url, { headers });
   if (!r.ok) throw new Error(`Download failed ${r.status}`);
+
   const buf = Buffer.from(await r.arrayBuffer());
-  const contentType = r.headers.get("content-type") || "application/octet-stream";
+  // Twilio può non mettere il content-type; prova a dedurre dall’estensione
+  let contentType = r.headers.get("content-type") || "";
+  if (!contentType) {
+    if (u.pathname.toLowerCase().endsWith(".pdf")) contentType = "application/pdf";
+    else if (u.pathname.toLowerCase().match(/\.(jpg|jpeg)$/)) contentType = "image/jpeg";
+    else if (u.pathname.toLowerCase().endsWith(".png")) contentType = "image/png";
+    else contentType = "application/octet-stream";
+  }
   return { buf, contentType };
 }
+
 
 // -------------------------------------------------------------
 // Health check
