@@ -237,6 +237,40 @@ app.get("/stripe/success", async (req, res) => {
     if (!session_id) return res.status(400).send("session_id mancante");
 
     const session = await stripe.checkout.sessions.retrieve(String(session_id));
+        // --- Salva ricevuta su Airtable (se configurato) ---
+    try {
+      if (AIRTABLE_API_KEY && AIRTABLE_BASE_ID) {
+        const meta = session.metadata || {};
+        const payload = {
+          records: [
+            {
+              fields: {
+                Name: `Receipt ${session.id}`,
+                Status: "Paid",
+                Amount: (session.amount_total || 0) / 100,
+                Ente: meta.ente || "",
+                IBAN: meta.iban || "",
+                Scadenza: meta.scadenza || "",
+                Description: meta.descr || "",
+                Timestamp: new Date().toISOString()
+              }
+            }
+          ]
+        };
+        const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(AIRTABLE_TABLE_JOBS)}`;
+        await fetch(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${AIRTABLE_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+      }
+    } catch (e) {
+      console.error("Airtable save error:", e);
+    }
+
     const amount = (session.amount_total || 0) / 100;
     const m = session.metadata || {};
     const html = `
