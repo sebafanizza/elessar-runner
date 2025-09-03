@@ -450,43 +450,40 @@ app.post("/whatsapp/webhook", express.urlencoded({ extended: false }), async (re
 // Airtable test
 app.get("/test-airtable", async (_req, res) => {
   try {
-    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+    if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID || !AIRTABLE_TABLE_JOBS) {
       return res.json({ ok: false, info: "Airtable non configurato" });
     }
-    const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(
-      AIRTABLE_TABLE_JOBS
-    )}`;
+
+    const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(AIRTABLE_TABLE_JOBS)}`;
     const now = new Date().toISOString();
+
+    // 👇 Nessun campo "Source"
     const payload = {
-      records: [
-        {
-          fields: {
-            Name: `Test Job ${now}`,
-            Status: "Created",
-            Source: "Runner",
-            Timestamp: now,
-          },
-        },
-      ],
+      records: [{
+        fields: {
+          Name: `Test Job ${now}`,
+          Status: "Created",          // deve esistere la colonna "Status" (single select)
+          Timestamp: now              // o Created time (Airtable ignora se non mappato)
+        }
+      }]
     };
+
     const r = await fetch2(url, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${AIRTABLE_API_KEY}`,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payload)
     });
     const data = await r.json();
-    if (!r.ok) {
-      return res.status(500).json({ ok: false, error: data });
-    }
+    if (!r.ok) return res.status(500).json({ ok: false, error: data });
     return res.json({ ok: true, created: data });
   } catch (err) {
-    console.error("Airtable err:", err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
+
 // -------------------------------------------------------------
 // Receipts dashboard (HTML)
 app.get("/receipts", async (_req, res) => {
