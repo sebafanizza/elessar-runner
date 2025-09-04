@@ -477,19 +477,18 @@ app.get("/receipts", async (_req, res) => {
     });
     const data = await r.json();
 
-    const rows = (data.records || [])
-      .map((rec) => {
-        const f = rec.fields || {};
-        return `<tr>
-          <td>${f.Name || ""}</td>
-          <td>${f.Amount ? "€ " + f.Amount.toFixed(2) : ""}</td>
-          <td>${f.Ente || ""}</td>
-          <td>${f.Scadenza || ""}</td>
-          <td>${f.Status || ""}</td>
-          <td>${f.Timestamp || ""}</td>
-        </tr>`;
-      })
-      .join("");
+   const rows = (data.records || []).map((rec) => {
+  const f = rec.fields || {};
+  const created = f.Timestamp || rec.createdTime || ""; // ← fallback al createdTime
+  return `<tr>
+    <td>${f.Name || ""}</td>
+    <td>${f.Amount != null ? "€ " + Number(f.Amount).toFixed(2) : ""}</td>
+    <td>${f.Ente || ""}</td>
+    <td>${f.Scadenza || ""}</td>
+    <td>${f.Status || ""}</td>
+    <td>${created}</td>
+  </tr>`;
+}).join("");
 
     const html = `
       <html><head>
