@@ -453,27 +453,19 @@ app.get("/test-airtable", async (_req, res) => {
     if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID || !AIRTABLE_TABLE_JOBS) {
       return res.json({ ok: false, info: "Airtable non configurato" });
     }
-
     const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(AIRTABLE_TABLE_JOBS)}`;
     const now = new Date().toISOString();
-
-    // 👇 Nessun campo "Source"
     const payload = {
       records: [{
         fields: {
           Name: `Test Job ${now}`,
-          Status: "Created",          // deve esistere la colonna "Status" (single select)
-          Timestamp: now              // o Created time (Airtable ignora se non mappato)
+          Status: "Created"         // ← niente Timestamp qui
         }
       }]
     };
-
     const r = await fetch2(url, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_API_KEY}`,
-        "Content-Type": "application/json"
-      },
+      headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
     const data = await r.json();
@@ -483,6 +475,7 @@ app.get("/test-airtable", async (_req, res) => {
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
+
 
 // -------------------------------------------------------------
 // Receipts dashboard (HTML)
